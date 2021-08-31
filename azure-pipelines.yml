@@ -1,0 +1,135 @@
+variables:
+    azureml.resourceGroup: 'TOR-PDS-POC-RG'
+    azureml.location: 'canadacentral'
+    amlcompute.clusterName: 'mlopscompute'
+    amlcompute.idleSecondsBeforeScaledown: 300
+    amlcompute.maxNodes: 2
+    amlcompute.minNodes: 0
+    amlcompute.vmSize: 'STANDARD_DS2_V2'
+    azureml.workspaceName: 'mlops-mlwksp'
+    experiment.name: 'porto_seguro_safe_driver_model_experiment'
+    model.name: 'porto_seguro_safe_driver_model'
+    service.name.staging: 'safedriver-svc-aci'
+
+trigger: none
+
+stages:
+- stage: Build
+  displayName: 'Train, Evaluate & Register The Model'
+  jobs:
+  - job: Train
+    displayName: 'Train, Evaluate & Register The Model'
+
+    pool:
+      vmImage: 'ubuntu-18.04'
+
+    #Your build pipeline references an undefined variable named ‘az ml datastore show-default -w $(azureml.workspaceName’. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab. See https://go.microsoft.com/fwlink/?linkid=865972
+    #Your build pipeline references an undefined variable named ‘jq -r .modelId metadata/model.json’. Create or edit the build pipeline for this YAML file, define the variable on the Variables tab. See https://go.microsoft.com/fwlink/?linkid=865972
+    
+
+    steps:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.6'
+      inputs:
+        versionSpec: 3.6
+
+#    - task: Bash@3
+#      displayName: 'Install Python Requirements'
+#      inputs:
+#        targetType: filePath
+#        filePath: './setup/install_requirements.sh'
+#        workingDirectory: setup
+
+#    - bash: 'pytest tests/unit/data_test.py --doctest-modules --junitxml=junit/test-results.xml --cov=data_test --cov-report=xml --cov-report=html '
+#      displayName: 'Data Quality Checks '
+#
+#    - task: PublishTestResults@2
+#      displayName: 'Publish Test Results **/test-*.xml'
+#      inputs:
+#        testResultsFiles: '**/test-*.xml'
+#      condition: succeededOrFailed()
+
+    
+        
+
+    - task: AzureCLI@2
+      displayName: 'Azure ML CLI Extension Add'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: 'az extension add --name azure-cli-ml'
+
+    - task: AzureCLI@2
+      displayName: 'Create Azure ML Service Workspace'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az ml workspace create -g $(azureml.resourceGroup) -w $(azureml.workspaceName) -l $(azureml.location) --exist-ok --yes
+        
+
+    - task: AzureCLI@2
+      displayName: 'Create Azure ML Compute Cluster'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az ml computetarget create amlcompute -g $(azureml.resourceGroup) -w $(azureml.workspaceName) -n $(amlcompute.clusterName) -s $(amlcompute.vmSize) --min-nodes $(amlcompute.minNodes) --max-nodes $(amlcompute.maxNodes) --idle-seconds-before-scaledown $(amlcompute.idleSecondsBeforeScaledown)
+        
+        
+
+    - task: AzureCLI@2
+      displayName: 'Upload Data To Default Data Store'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az ml datastore upload -g $(azureml.resourceGroup) -w $(azureml.workspaceName) -n $(az ml datastore show-default -w $(azureml.workspaceName) -g $(azureml.resourceGroup) --query name -o tsv) -p data -u safe_driver --overwrite true
+
+    - bash: 'mkdir metadata && mkdir models'
+      displayName: 'Create Metadata and Model Folders'
+
+    - task: AzureCLI@2
+      displayName: 'Train Model'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: 'az ml run submit-script -g $(azureml.resourceGroup) -w $(azureml.workspaceName) -e $(experiment.name) --ct $(amlcompute.clusterName) -d conda_dependencies.yml -c safe_driver -t ../metadata/run.json train.py'
+        workingDirectory: training
+
+    - task: AzureCLI@2
+      displayName: 'Register Model'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: 'az ml model register -g $(azureml.resourceGroup) -w $(azureml.workspaceName) -n $(model.name) -f metadata/run.json  --asset-path outputs/models/porto_seguro_safe_driver_model.pkl -d "Linear model using diabetes dataset" --tag "data"="diabetes" --tag "model"="regression" --model-framework ScikitLearn -t metadata/model.json'
+    - task: AzureCLI@2
+      displayName: 'Download Model'
+      inputs:
+        azureSubscription: AzureMLConnection
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: 'az ml model download -g $(azureml.resourceGroup) -w $(azureml.workspaceName) -i $(jq -r .modelId metadata/model.json) -t ./models --overwrite'
+
+    - task: CopyFiles@2
+      displayName: 'Copy Files to: $(Build.ArtifactStagingDirectory)'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+            **/metadata/*
+            **/models/*
+            **/deployment/*
+            **/setup/*
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Pipeline Artifact'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: drop
